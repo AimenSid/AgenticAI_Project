@@ -1,0 +1,171 @@
+import os
+from dotenv import load_dotenv
+import chainlit as cl
+import json
+import matplotlib
+matplotlib.use("Agg")  # safe for headless envs (Hugging Face)
+import matplotlib.pyplot as plt
+
+
+# Load environment variables from .env file
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+print("GEMINI_API_KEY:", GEMINI_API_KEY)
+
+from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel, set_tracing_disabled
+from agents import function_tool
+
+# Tracing disabled
+set_tracing_disabled(disabled=True)
+
+# 1. Which LLM Service?
+external_client: AsyncOpenAI = AsyncOpenAI(
+    api_key=GEMINI_API_KEY,
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+)
+
+# 2. Which LLM Model?
+llm_model: OpenAIChatCompletionsModel = OpenAIChatCompletionsModel(
+    model="gemini-2.5-flash",
+    openai_client=external_client
+)
+
+@function_tool
+def run_subeditor_agent(text: str):
+    """Polish grammar, style, and clarity in the text."""
+    result = Runner.run_sync(subeditor_agent, text)
+    return result.final_output
+
+
+@function_tool
+def run_fact_checker(text: str):
+    """Check facts, figures, and claims in the text."""
+    result = Runner.run_sync(fact_checker_agent, text)
+    return result.final_output
+
+
+@function_tool
+def run_data_agent(text: str):
+    """Extract names, dates, figures, and locations into structured JSON."""
+    result = Runner.run_sync(data_agent, text)
+    return json.dumps(result.final_output, indent=2)
+    
+
+
+@function_tool
+def run_summary_agent(text: str):
+    """Summarise the text into a short, clear paragraph."""
+    result = Runner.run_sync(summary_agent, text)
+    return result.final_output
+
+
+@function_tool
+def run_headline_agent(text: str):
+    """Suggest short, punchy headlines for the text."""
+    result = Runner.run_sync(headline_agent, text)
+    return result.final_output
+
+
+def _generate_infographic_from_data(data: dict) -> str:
+    # Expecting lists under these keys
+    figures = data.get("figures", [])
+    dates = data.get("dates", [])
+
+    # Minimal parsing: turn "2.5%", "$3bn", "1,234" into floats
+    def to_number(s: str):
+        x = s.strip().lower().replace(",", "")
+        # handle percent
+        if x.endswith("%"):
+            return float(x[:-1])
+        # handle currency and multipliers
+        mult = 1.0
+        if "bn" in x or "billion" in x:
+            mult = 1e9
+        elif "m" in x or "million" in x:
+            mult = 1e6
+        # strip currency symbols/words
+        for token in ["$", "rs", "pkr", "usd", "bn", "billion", "m", "million"]:
+            x = x.replace(token, "")
+        x = x.strip()
+        return float(x) * mult
+
+    nums = []
+    xs = []
+    for d, f in zip(dates, figures):
+        try:
+            nums.append(to_number(f))
+            xs.append(d)
+        except Exception:
+            # skip unparsable points
+            pass
+
+    if not xs or not nums:
+        return "No plottable points found."
+
+    plt.figure(figsize=(7, 4))
+    plt.plot(xs, nums, marker="o")
+    plt.title("Figures over time")
+    plt.xlabel("Date")
+    plt.ylabel("Value")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+
+    out_path = "infographic.png"
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+    return out_path
+
+@function_tool
+def run_infographic_agent(json_data: str) -> str:
+    """
+    Generate a simple infographic from a JSON string that looks like:
+    {"figures": ["2.5%", "$3bn"], "dates": ["2025-06-01", "2025-07-01"]}
+    Returns the saved image path.
+    """
+    try:
+        data = json.loads(json_data)
+    except Exception:
+        return "Invalid JSON. Provide a JSON string with keys like figures and dates."
+
+    if not isinstance(data, dict):
+        return "JSON root must be an object."
+
+    return _generate_infographic_from_data(data)
+
+
+subediting_agent: Agent = Agent(name="SubeditingAgent",
+                     instructions="You are a journalist working for a media group based in Pakistan, which runs a TV channel, a digital news website and social media handles across Twitter, Facebook, Instagram and TikTok. Your primary task is to take press releases issued by departments, institutions or individuals and convert them into news reports for various platforms. Ensure that the information provided in the press release is in context, and whether the statement is accurate in terms of its content. Override learned information if it comes into conflict with the press release provided. Based on the information provided, generate a script for a TV news bulletin, a 300 word news article. Suggest at least three SEO optimized headlines for this article based on the main keywords and subjects included in the press release. You can use the run_subeditor_agent function to edit for grammar and clarity. You can use the run_fact_checker function for fact-checking. You can use the run_data_agent function to extract data. You can use the run_summary_agent to summarise the text. You can use the run_infographic_agent function to generate graphs",
+                     model=llm_model) # gemini-2.5 as agent brain - chat completions
+
+def run_agent(question: str):
+    result: Runner = Runner.run_sync(subediting_agent, question)
+    return result
+
+conversation : list = []
+
+@cl.on_chat_start
+async def start():
+    await cl.Message(
+        content="👋 Hello! I’m your Subeditor Bot. I work like a newsroom subeditor — taking press releases and turning them into news reports, articles, TV scripts, and SEO headlines. Type or paste a press release to get started."
+    ).send()
+
+@cl.on_message
+async def main(message: cl.Message):
+    global conversation
+    # Our custom logic goes here...
+    # Send a fake response back to the user
+    
+    if len(conversation) == 0:
+        response = run_agent(message.content)
+        new_input = response.to_input_list() + [{"role": "user", "content": message.content}]
+    else:
+        new_input = conversation + [{"role": "user", "content": message.content}]
+    
+    response = run_agent(new_input)
+    conversation = response.to_input_list()
+    
+    await cl.Message(
+        content=f"Received: {response.final_output}"
+    ).send()
